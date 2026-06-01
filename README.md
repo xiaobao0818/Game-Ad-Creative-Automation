@@ -237,36 +237,38 @@ npm run dev
 
 ### 4. 端到端体验
 
-1. 准备素材文件夹（图片 + 文字介绍）
-2. 浏览器打开 `http://localhost:3000`
-3. 点击「新建项目」→ 填项目名 + 素材绝对路径
-4. 依次走完 **6 阶段**（每步都有进度提示和可恢复的状态）
-5. 最终在 Step 6 看到 15 秒竖屏视频，可在线播放 / 下载
+1. 浏览器打开 `http://localhost:3000`
+2. 点击「新建项目」→ 填项目名 + 拖拽/选择素材文件
+3. 依次走完 **6 阶段**（每步都有进度提示和可恢复的状态）
+4. 最终在 Step 6 看到 15 秒竖屏视频，可在线播放 / 下载
 
 ---
 
 ## 使用指南
 
-### 素材文件夹推荐结构
+### 素材上传
 
-```
-my-game-assets/
-├── 游戏介绍.txt           # 游戏世界观、核心玩法、特色系统
-├── 角色介绍.md            # 主要角色说明
-├── hero_01.png           # 主角展示图
-├── hero_02.png           # 重要角色展示图
-├── battle_scene_01.jpg   # 战斗场景截图
-├── battle_scene_02.jpg   # 不同玩法场景
-├── ui_home.jpg           # 主界面截图
-├── ui_gacha.jpg          # 抽卡/福利界面
-└── art_style_ref.webp    # 画风参考图
-```
+直接在创建项目时拖拽 / 选择文件即可（不用手动配路径）。每个项目拥有独立的 uploads 目录 `server/uploads/projects/<id>/`，项目删除时自动清理。
+
+支持的格式：
+- 图片：`.png` / `.jpg` / `.jpeg` / `.webp` / `.gif`
+- 文本：`.txt` / `.md`
 
 **建议：**
 
 - 图片尽量清晰，至少 512px 宽
 - 文字描述越详细越好（玩法、特色系统、付费点等）
 - 图片数量 5-15 张，**前 5 张**会用于 AI 视觉分析
+- 单文件 ≤ 50MB（可通过 `MAX_UPLOAD_BYTES` 调整）
+- 单次请求 ≤ 20 个文件（可通过 `MAX_FILES_PER_UPLOAD` 调整）
+
+如果想从本地文件夹批量导入，也可以在项目详情页「素材管理」区多次上传，或直接用 curl：
+
+```bash
+curl -X POST http://localhost:3001/api/projects/1/assets/upload \
+  -F "files=@hero.png" \
+  -F "files=@intro.md"
+```
 
 ### 创意方向选择
 
@@ -463,6 +465,9 @@ Base URL：`http://localhost:3001/api`
 | `POST` | `/projects/:id/generate-ref-images` | 并行调用 Seedream 生成参考图（**校验 scriptId 归属**） |
 | `POST` | `/projects/:id/generate-video` | 调用火山方舟 Seedance 生成最终视频（**校验 scriptId + refImageIds 归属**） |
 | `GET` | `/projects/:id/scripts` | 获取项目下所有脚本 |
+| `GET` | `/projects/:id/assets` | 获取项目下已上传的素材列表 |
+| `POST` | `/projects/:id/assets/upload` | **上传素材**（multipart，字段名 `files`，支持多文件） |
+| `DELETE` | `/projects/:id/assets/:assetId` | 删除单个素材（同步删磁盘文件） |
 
 ### 脚本管理
 
@@ -573,7 +578,7 @@ scripts (1)  ──< video_generations (N)
 | `description` | TEXT | 项目描述 |
 | `game_genre` | TEXT | 游戏类型 |
 | `art_style` | TEXT | 画风 |
-| `asset_path` | TEXT | 素材文件夹**绝对路径** |
+| `asset_path` | TEXT | 手动指定的素材目录（**可选**，留空时流水线自动用 uploads dir） |
 | `profile_json` | TEXT(JSON) | 完整 `GameProfile`，Drizzle 自动序列化 |
 | `status` | TEXT | `draft` / `analyzed` / `directions_ready` |
 | `created_at` | TEXT | 创建时间 |
@@ -587,7 +592,7 @@ scripts (1)  ──< video_generations (N)
 | `project_id` | INTEGER | 外键 → projects |
 | `type` | TEXT | `image` / `text` |
 | `filename` | TEXT | 文件名 |
-| `file_path` | TEXT | 绝对路径 |
+| `file_path` | TEXT | 文件绝对路径（位于 `server/uploads/projects/<id>/`） |
 | `ai_description` | TEXT | AI 生成的描述（文本素材） |
 | `ai_tags` | TEXT(JSON) | AI 标签数组（图片素材） |
 | `created_at` | TEXT | 创建时间 |
@@ -653,9 +658,7 @@ scripts (1)  ──< video_generations (N)
    
    **生产部署前必须加鉴权**（建议：API Key 中间件 + 用户系统）。
 
-2. **素材路径是用户输入的绝对路径**：服务器会用 `fs.readFileSync` 读取，**没有目录隔离**。可访问文件系统任意位置。
-   
-   **生产前必须做**：限定可读目录范围 / 上传文件而不是传路径。
+2. ~~**素材路径是用户输入的绝对路径**：服务器会用 `fs.readFileSync` 读取，**没有目录隔离**。可访问文件系统任意位置。~~ ✅ **已修复**：现在改用 multipart 上传到 `server/uploads/projects/<id>/`，文件名用 `path.basename` 清洗，不接受任何用户提供的路径。
 
 3. **CORS 默认放行 localhost**：通过 `CORS_ORIGIN` 环境变量配置；不配置则只允许 `localhost:3000` 和 `localhost:3001`。
 
@@ -703,9 +706,9 @@ cd client && npm install --legacy-peer-deps
 
 检查：
 1. 图片格式是否在 `.png` / `.jpg` / `.jpeg` / `.webp` / `.gif` 范围内
-2. 素材文件夹**绝对路径**是否正确
-3. 服务器进程是否有该路径的读权限
-4. 视觉得分超过 4MB 会被 `MAX_IMAGE_BYTES` 拒绝
+2. 是否在项目详情页成功上传（可看到文件列表）
+3. 视觉得分超过 4MB 会被 `MAX_IMAGE_BYTES` 拒绝
+4. 单文件超过 50MB 会被上传端点直接拒绝（看响应里的 `rejected` 列表）
 
 ### Q: 创意方向生成结果不理想？
 
@@ -759,12 +762,13 @@ WAL 模式下还会生成 `game-ad-workshop.db-wal` 和 `game-ad-workshop.db-shm
 - [x] Status 字段白名单
 - [x] 错误持久化
 - [x] 轮询去重 + 15 分钟超时
+- [x] **multipart 文件上传**(替代用户输入路径)
 
 ### 🚧 待做（按优先级）
 
 | 优先级 | 任务 | 影响 |
 |--------|------|------|
-| P0 | 文件上传替代路径输入 | 用户能直接拖拽上传，不用配置服务器路径 |
+| P0 | ~~文件上传替代路径输入~~ | ✅ 已完成 |
 | P0 | 鉴权 / 用户系统 | 防止 AI 额度被刷、数据被读 |
 | P0 | 限流 | 同上 |
 | P1 | 单元测试（pipeline + provider-config） | 重构安全网 |
