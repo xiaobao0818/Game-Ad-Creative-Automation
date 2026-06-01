@@ -9,14 +9,29 @@ import {
 } from '../agents/script-generator'
 import { genImage } from '../services/media-gen'
 import { generateAdVideo } from '../agents/video-generator'
+import { getProjectUploadsDir } from '../lib/uploads'
 import fs from 'fs'
 import path from 'path'
 
 /**
  * Stage 1 + 2: 扫描素材 + AI 分析游戏特征
  * 分析结果完整存储在 project.profileJson 中
+ *
+ * assetPath 留空时默认读 uploads dir。
  */
 export async function analyzeProject(
+  projectId: number,
+  assetPath: string
+): Promise<{ gameProfile: GameProfile; texts: string[]; imagePaths: string[] }> {
+  const resolvedPath = resolveAssetDir(projectId, assetPath)
+  if (!fs.existsSync(resolvedPath)) {
+    throw new Error(`素材文件夹不存在: ${resolvedPath}`)
+  }
+  // 用 resolvedPath 替换原 assetPath 在函数内的使用
+  return await analyzeProjectInDir(projectId, resolvedPath)
+}
+
+async function analyzeProjectInDir(
   projectId: number,
   assetPath: string
 ): Promise<{ gameProfile: GameProfile; texts: string[]; imagePaths: string[] }> {
@@ -115,6 +130,15 @@ export async function assertScriptBelongsToProject(scriptId: number, projectId: 
   }
 }
 
+/** 通过 scriptId 查 projectId(只取 projectId 字段) */
+async function getProjectIdByScriptId(scriptId: number): Promise<number> {
+  const script = await db.query.scripts.findFirst({
+    where: eq(schema.scripts.id, scriptId),
+    columns: { projectId: true },
+  })
+  return script?.projectId ?? 0
+}
+
 /**
  * Stage 3: 生成创意方向（供用户选择）
  * 返回 direction 数据以及对应的脚本 ID 列表
@@ -156,7 +180,7 @@ export async function generateScriptForDirection(
   direction: CreativeDirection,
   assetPath: string
 ): Promise<DetailedScript> {
-  const gameAssetsSummary = buildAssetsSummary(assetPath)
+  const gameAssetsSummary = buildAssetsSummaryForProject(scriptId ? await getProjectIdByScriptId(scriptId) : 0, assetPath)
   const detailedScript = await generateDetailedScript(gameProfile, direction, gameAssetsSummary)
 
   // 更新脚本记录 — 存储完整内容（包括 refImagePrompts 和 productionNotes）
@@ -282,7 +306,20 @@ export async function generateAdVideoForScript(
   )
 }
 
+/** 决定本次分析/汇总使用的素材目录。优先项目自带的 assetPath，否则用 uploads dir */
+function resolveAssetDir(projectId: number, assetPath: string): string {
+  if (assetPath && fs.existsSync(assetPath)) return assetPath
+  const uploadsDir = getProjectUploadsDir(projectId)
+  if (fs.existsSync(uploadsDir)) return uploadsDir
+  // 都没有：让上层报错（"素材文件夹不存在"）
+  return assetPath || uploadsDir
+}
+
 /** 汇总素材文件夹内容 */
+function buildAssetsSummaryForProject(projectId: number, assetPath: string): string {
+  return buildAssetsSummary(resolveAssetDir(projectId, assetPath))
+}
+
 function buildAssetsSummary(assetPath: string): string {
   if (!fs.existsSync(assetPath)) return '暂无素材'
 

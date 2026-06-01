@@ -15,14 +15,65 @@
           <h1>{{ project.name }}</h1>
           <p style="color: var(--color-text-muted);">{{ project.description || '暂无描述' }}</p>
           <p style="color: var(--color-text-muted); font-size: 13px; margin-top: 4px;">
-            素材: {{ project.assetPath || '未设置' }}
-            <span v-if="!project.assetPath" style="color: var(--color-danger);">
-              — 请先设置素材文件夹路径
+            <span v-if="!assets.length" style="color: var(--color-danger);">
+              ⚠ 请先上传素材（图片 / 文字介绍）
+            </span>
+            <span v-else>
+              素材: {{ assets.length }} 个文件（{{ assets.filter(a => a.type === 'image').length }} 张图 + {{ assets.filter(a => a.type === 'text').length }} 个文本）
             </span>
           </p>
         </div>
         <span class="badge" :class="`badge-${project.status}`">{{ statusMap[project.status] || project.status }}</span>
       </header>
+
+      <!-- ====== 素材上传区（始终可见） ====== -->
+      <div class="step-card card active">
+        <div class="step-content">
+          <h3 style="font-size: 16px; margin-bottom: 8px;">素材管理</h3>
+          <div
+            class="drop-zone"
+            :class="{ active: dragOver }"
+            @dragover.prevent="dragOver = true"
+            @dragleave="dragOver = false"
+            @drop.prevent="onAssetDrop"
+            @click="assetInput?.click()"
+          >
+            <input
+              ref="assetInput"
+              type="file"
+              multiple
+              accept=".png,.jpg,.jpeg,.webp,.gif,.txt,.md"
+              style="display: none;"
+              @change="onAssetPick"
+            />
+            <div v-if="uploading" style="display: flex; align-items: center; justify-content: center; gap: 8px;">
+              <span class="spinner" style="width: 14px; height: 14px;"></span>
+              上传中...
+            </div>
+            <div v-else style="color: var(--color-text-muted); font-size: 13px;">
+              拖拽文件到此处，或<u style="cursor: pointer; color: var(--color-primary);">点击选择</u>
+              <span style="font-size: 11px; display: block; margin-top: 4px;">
+                支持 .png / .jpg / .webp / .gif / .txt / .md
+              </span>
+            </div>
+          </div>
+
+          <!-- 已上传文件列表 -->
+          <div v-if="assets.length" class="asset-list" style="margin-top: 16px;">
+            <div v-for="asset in assets" :key="asset.id" class="asset-row">
+              <span class="asset-icon">{{ asset.type === 'image' ? '🖼' : '📄' }}</span>
+              <span class="asset-name">{{ asset.filename }}</span>
+              <span class="asset-meta">
+                <span class="asset-type-badge">{{ asset.type === 'image' ? '图' : '文' }}</span>
+              </span>
+              <button class="btn btn-sm" @click="doDeleteAsset(asset.id)">删除</button>
+            </div>
+          </div>
+          <div v-if="uploadError" style="color: var(--color-danger); margin-top: 8px; font-size: 13px;">
+            {{ uploadError }}
+          </div>
+        </div>
+      </div>
 
       <!-- ====== Step 1: 素材分析 ====== -->
       <div class="step-card card" :class="{ active: currentStep === 1 }">
@@ -47,7 +98,7 @@
             v-if="!gameProfile"
             class="btn btn-primary"
             style="margin-top: 16px;"
-            :disabled="analyzing || !project.assetPath"
+            :disabled="analyzing || !assets.length"
             @click="doAnalyze"
           >
             <span v-if="analyzing" class="spinner" style="width: 14px; height: 14px; margin-right: 8px;"></span>
@@ -257,7 +308,18 @@
 <script setup lang="ts">
 const route = useRoute()
 const projectId = Number(route.params.id)
-const { getProject, analyzeProject, generateDirections, generateScript, generateRefImages, generateVideo, fetchScripts } = useProjects()
+const {
+  getProject,
+  analyzeProject,
+  generateDirections,
+  generateScript,
+  generateRefImages,
+  generateVideo,
+  fetchScripts,
+  uploadAssets,
+  listAssets,
+  deleteAsset,
+} = useProjects()
 const { getRefImages, getVideos } = useScripts()
 const { checkRefImage, checkVideo } = useGenerationStatus()
 
@@ -272,6 +334,13 @@ const refImages = ref<any[]>([])
 const refImageStatus = ref('')
 const videos = ref<any[]>([])
 const currentStep = ref(1)
+
+// 素材上传相关
+const assets = ref<any[]>([])
+const uploading = ref(false)
+const uploadError = ref('')
+const dragOver = ref(false)
+const assetInput = ref<HTMLInputElement | null>(null)
 
 const analyzing = ref(false)
 const generatingDirections = ref(false)
@@ -336,6 +405,11 @@ const actualVideoPrompt = computed(() => {
 
 onMounted(async () => {
   project.value = await getProject(projectId)
+  // 加载素材列表
+  try {
+    assets.value = await listAssets(projectId)
+  } catch { /* 首次进入 */ }
+
   // profileJson 已经是 Drizzle JSON mode 自动反序列化后的对象，不要再 JSON.parse
   if (project.value?.profileJson && project.value.profileJson.gameGenre) {
     gameProfile.value = project.value.profileJson
@@ -546,6 +620,50 @@ async function pollVideo(id: number) {
 
 function copyText(text: string) {
   navigator.clipboard.writeText(text)
+}
+
+// ====== 素材上传 ======
+
+function onAssetDrop(e: DragEvent) {
+  dragOver.value = false
+  const files = e.dataTransfer?.files
+  if (files) doUpload(Array.from(files))
+}
+
+function onAssetPick(e: Event) {
+  const input = e.target as HTMLInputElement
+  if (input.files) doUpload(Array.from(input.files))
+  input.value = ''
+}
+
+async function doUpload(files: File[]) {
+  if (!files.length || uploading.value) return
+  uploading.value = true
+  uploadError.value = ''
+  try {
+    const result = await uploadAssets(projectId, files)
+    // 合并：失败的文件名 + 原因
+    if (result.rejected?.length) {
+      const msg = result.rejected.map(r => `${r.filename}: ${r.reason}`).join('; ')
+      uploadError.value = `部分文件被拒绝 - ${msg}`
+    }
+    // 重新拉素材列表
+    assets.value = await listAssets(projectId)
+  } catch (e: any) {
+    uploadError.value = e.message
+  } finally {
+    uploading.value = false
+  }
+}
+
+async function doDeleteAsset(assetId: number) {
+  if (!confirm('确定删除该素材？')) return
+  try {
+    await deleteAsset(projectId, assetId)
+    assets.value = await listAssets(projectId)
+  } catch (e: any) {
+    alert('删除失败: ' + e.message)
+  }
 }
 </script>
 
@@ -771,6 +889,55 @@ function copyText(text: string) {
   border-radius: var(--radius-sm);
   width: 100%;
   max-width: 360px;
+}
+
+.drop-zone {
+  border: 2px dashed var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 24px;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.2s;
+  background: var(--color-bg);
+}
+.drop-zone:hover,
+.drop-zone.active {
+  border-color: var(--color-primary);
+  background: rgba(108, 92, 231, 0.05);
+}
+
+.asset-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 280px;
+  overflow-y: auto;
+}
+.asset-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  background: var(--color-bg);
+  border-radius: 4px;
+  font-size: 13px;
+}
+.asset-icon { font-size: 16px; }
+.asset-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text-muted);
+}
+.asset-meta { display: flex; align-items: center; gap: 8px; }
+.asset-type-badge {
+  font-size: 10px;
+  padding: 2px 6px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  color: var(--color-text-muted);
 }
 
 @media (max-width: 768px) {

@@ -12,6 +12,18 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
   return res.json()
 }
 
+/** 上传文件的封装:走 multipart/form-data,不走 JSON 头 */
+async function apiUpload<T>(path: string, files: File[]): Promise<T> {
+  const form = new FormData()
+  for (const f of files) form.append('files', f, f.name)
+  const res = await fetch(`${API_BASE}${path}`, { method: 'POST', body: form })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Upload failed' }))
+    throw new Error(err.message || err.error || `HTTP ${res.status}`)
+  }
+  return res.json()
+}
+
 // ====== 项目管理 ======
 export function useProjects() {
   const projects = ref<any[]>([])
@@ -29,6 +41,22 @@ export function useProjects() {
   }
 
   const getProject = (id: number) => apiFetch(`/projects/${id}`)
+
+  // 素材上传
+  const uploadAssets = (projectId: number, files: File[]) =>
+    apiUpload<{
+      ok: boolean
+      uploaded: { id: number; filename: string; size: number; type: 'image' | 'text' }[]
+      rejected: { filename: string; reason: string }[]
+      uploadsDir: string
+      projectAssetPath: string
+    }>(`/projects/${projectId}/assets/upload`, files)
+
+  const listAssets = (projectId: number) =>
+    apiFetch(`/projects/${projectId}/assets`)
+
+  const deleteAsset = (projectId: number, assetId: number) =>
+    apiFetch(`/projects/${projectId}/assets/${assetId}`, { method: 'DELETE' })
 
   // Stage 1+2: 分析素材
   const analyzeProject = (id: number) =>
@@ -72,6 +100,7 @@ export function useProjects() {
     fetchAll, create, getProject,
     analyzeProject, getDirections, generateDirections,
     generateScript, generateRefImages, generateVideo, fetchScripts,
+    uploadAssets, listAssets, deleteAsset,
   }
 }
 

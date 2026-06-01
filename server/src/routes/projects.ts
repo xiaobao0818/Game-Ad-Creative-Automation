@@ -10,6 +10,14 @@ import {
   loadGameProfile,
   assertScriptBelongsToProject,
 } from '../pipeline'
+import {
+  ensureProjectUploadsDir,
+  cleanupProjectUploads,
+  isAllowedUploadExt,
+  getProjectUploadsDir,
+} from '../lib/uploads'
+import path from 'path'
+import fs from 'fs'
 
 const app = new Hono()
 
@@ -44,6 +52,147 @@ app.get('/:id', async (c) => {
 app.delete('/:id', async (c) => {
   const id = Number(c.req.param('id'))
   await db.delete(schema.projects).where(eq(schema.projects.id, id))
+  // 同时清理 uploads 目录
+  cleanupProjectUploads(id)
+  return c.json({ ok: true })
+})
+
+// ========== 素材上传 ==========
+
+/** 获取项目下已上传的素材列表 */
+app.get('/:id/assets', async (c) => {
+  const id = Number(c.req.param('id'))
+  const rows = await db.select().from(schema.assets)
+    .where(eq(schema.assets.projectId, id))
+    .orderBy(desc(schema.assets.createdAt))
+  return c.json(rows)
+})
+
+/** 上传素材文件（multipart/form-data，字段名 files） */
+app.post('/:id/assets/upload', async (c) => {
+  const id = Number(c.req.param('id'))
+
+  const project = await db.query.projects.findFirst({ where: eq(schema.projects.id, id) })
+  if (!project) return c.json({ error: '项目不存在' }, 404)
+
+  const maxFileBytes = Number(process.env.MAX_UPLOAD_BYTES) || 50 * 1024 * 1024  // 50MB
+  const maxFiles = Number(process.env.MAX_FILES_PER_UPLOAD) || 20
+
+  let form: FormData
+  try {
+    form = await c.req.formData()
+  } catch {
+    return c.json({ error: '请求不是合法的 multipart/form-data' }, 400)
+  }
+
+  // 收集所有 files 字段（前端可能传多次同名字段）
+  const fileEntries: File[] = []
+  for (const [key, value] of form.entries()) {
+    if (key !== 'files') continue
+    if (value instanceof File) fileEntries.push(value)
+  }
+
+  if (fileEntries.length === 0) {
+    return c.json({ error: '没有收到任何文件（请用 files 字段）' }, 400)
+  }
+  if (fileEntries.length > maxFiles) {
+    return c.json({ error: `一次最多上传 ${maxFiles} 个文件,收到 ${fileEntries.length} 个` }, 400)
+  }
+
+  const uploadsDir = ensureProjectUploadsDir(id)
+  const created: { id: number; filename: string; size: number; type: 'image' | 'text' }[] = []
+  const rejected: { filename: string; reason: string }[] = []
+
+  for (const file of fileEntries) {
+    // 1) 文件名清洗：去掉路径前缀，只保留 basename
+    const cleanName = path.basename(file.name || 'unnamed')
+    if (!isAllowedUploadExt(cleanName)) {
+      rejected.push({ filename: cleanName, reason: '不支持的文件类型（仅 .png/.jpg/.webp/.gif/.txt/.md）' })
+      continue
+    }
+    if (file.size > maxFileBytes) {
+      rejected.push({
+        filename: cleanName,
+        reason: `文件超过 ${(maxFileBytes / 1024 / 1024).toFixed(0)}MB`,
+      })
+      continue
+    }
+    if (file.size === 0) {
+      rejected.push({ filename: cleanName, reason: '空文件' })
+      continue
+    }
+
+    // 2) 写入磁盘（同名文件加后缀避免覆盖）
+    const targetPath = getUniquePath(uploadsDir, cleanName)
+    const buffer = Buffer.from(await file.arrayBuffer())
+    fs.writeFileSync(targetPath, buffer)
+
+    // 3) 入库
+    const ext = path.extname(cleanName).toLowerCase()
+    const isImage = ['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(ext)
+    const [record] = await db.insert(schema.assets).values({
+      projectId: id,
+      type: isImage ? 'image' : 'text',
+      filename: path.basename(targetPath),
+      filePath: targetPath,
+    }).returning({ id: schema.assets.id })
+
+    created.push({
+      id: record.id,
+      filename: path.basename(targetPath),
+      size: file.size,
+      type: isImage ? 'image' : 'text',
+    })
+  }
+
+  return c.json({
+    ok: true,
+    uploaded: created,
+    rejected,
+    uploadsDir,
+    projectAssetPath: getProjectUploadsDir(id),
+  }, 201)
+})
+
+/** 在 uploadsDir 下找一个不冲突的文件路径（同名加 _1 _2 ...） */
+function getUniquePath(dir: string, filename: string): string {
+  const ext = path.extname(filename)
+  const base = path.basename(filename, ext)
+  let candidate = path.join(dir, filename)
+  let n = 1
+  while (fs.existsSync(candidate)) {
+    candidate = path.join(dir, `${base}_${n}${ext}`)
+    n++
+  }
+  return candidate
+}
+
+/** 删除单个素材（同时删文件 + DB 记录） */
+app.delete('/:id/assets/:assetId', async (c) => {
+  const id = Number(c.req.param('id'))
+  const assetId = Number(c.req.param('assetId'))
+  if (isNaN(id) || isNaN(assetId)) {
+    return c.json({ error: '无效的 ID' }, 400)
+  }
+
+  const asset = await db.query.assets.findFirst({
+    where: eq(schema.assets.id, assetId),
+  })
+  if (!asset) return c.json({ error: '素材不存在' }, 404)
+  if (asset.projectId !== id) {
+    return c.json({ error: '素材不属于该项目' }, 403)
+  }
+
+  // 删磁盘文件（best-effort）
+  try {
+    if (fs.existsSync(asset.filePath)) {
+      fs.unlinkSync(asset.filePath)
+    }
+  } catch (err) {
+    console.warn(`[delete asset] 文件删除失败: ${asset.filePath}`, err)
+  }
+  // 删 DB 记录
+  await db.delete(schema.assets).where(eq(schema.assets.id, assetId))
   return c.json({ ok: true })
 })
 
