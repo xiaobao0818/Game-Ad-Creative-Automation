@@ -4,8 +4,15 @@
  * Seedance 2.0: 视频生成
  */
 
-const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY || ''
-const MINIMAX_BASE = 'https://api.minimax.chat'
+import { getProviderConfig } from './provider-config'
+
+function getBaseUrl(): string {
+  return getProviderConfig().minimax.baseUrl
+}
+
+function getApiKey(): string {
+  return getProviderConfig().minimax.apiKey
+}
 
 interface SeedreamRequest {
   prompt: string
@@ -31,10 +38,10 @@ interface TaskResult {
 }
 
 async function minimaxPost(endpoint: string, body: any): Promise<any> {
-  const res = await fetch(`${MINIMAX_BASE}${endpoint}`, {
+  const res = await fetch(`${getBaseUrl()}${endpoint}`, {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${MINIMAX_API_KEY}`,
+      'Authorization': `Bearer ${getApiKey()}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(body),

@@ -159,7 +159,7 @@ AI 从 8 种策略角度（反转剧情、福利诱惑、玩法秀、悬念揭�
 | ORM | Drizzle ORM | 0.30 | 类型安全 |
 | AI 文本 | GPT-4o / 豆包 Pro | - | 支持多 Provider |
 | AI 图片 | Seedream 4.0 / 5.0 | - | 火山引擎 / MiniMax |
-| AI 视频 | Seedance 1.0 Pro / 2.0 | - | 火山引擎 / MiniMax |
+| AI 视频 | Seedance 1.0 Pro / 1.5 Pro / 2.0 | - | 火山方舟 `contents/generations/tasks`(默认,MiniMax 兜底) |
 
 ---
 
@@ -270,7 +270,7 @@ my-game-assets/
 ### 提示词使用
 
 生成的 Seedance 视频提示词可直接用于：
-- 火山引擎方舟 → Seedance 1.0 Pro
+- 火山引擎方舟 → Seedance 1.0 Pro / 1.5 Pro / 2.0（通过 `POST /api/v3/contents/generations/tasks`，支持文 + 多图输入）
 - MiniMax → Seedance 2.0
 
 生成的 Seedream 参考图提示词可直接用于：
@@ -301,7 +301,7 @@ VOLCENGINE_ARK_ENDPOINT_ID=ep-xxxxxxxxxxxx
 使用：
 - 文本：豆包（通过方舟推理接入点）
 - 图片：豆包 Seedream 4.0
-- 视频：豆包 Seedance 1.0 Pro
+- 视频：豆包 Seedance 1.0 Pro（默认）/ 1.5 Pro / 2.0，通过方舟 `contents/generations/tasks` 接口
 
 ### 方案二：MiniMax 全链路
 
@@ -358,6 +358,7 @@ Base URL: `http://localhost:3001/api`
 | `GET` | `/projects/:id/directions` | 获取已有创意方向 |
 | `POST` | `/projects/:id/generate-script` | 选定方向，生成详细脚本 |
 | `POST` | `/projects/:id/generate-ref-images` | 调用 AI 生成参考图 |
+| `POST` | `/projects/:id/generate-video` | 调用火山方舟 Seedance 生成最终视频 |
 | `GET` | `/projects/:id/scripts` | 获取项目下所有脚本 |
 
 ### 脚本管理
@@ -456,7 +457,7 @@ game-ad-workshop/
 │       ├── agents/                 # AI Agent 层
 │       │   ├── asset-analyzer.ts   # 素材分析：输出 GameProfile
 │       │   ├── script-generator.ts # 脚本创作：创意方向 + 详细脚本
-│       │   ├── ref-image-generator.ts # 参考图提示词 + Seedream 调用
+│       │   ├── script-generator.ts  # 创意方向 + 详细脚本
 │       │   └── video-generator.ts  # 视频提示词 + Seedance 调用
 │       ├── pipeline/
 │       │   └── index.ts            # 流程编排：串联 5 个 Pipeline 阶段

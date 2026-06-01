@@ -32,8 +32,14 @@ export interface ProviderConfig {
     arkBaseUrl: string
     /** 即梦图片模型 */
     imageModel: string
-    /** 视频模型 */
+    /** 视频模型（Seedance 1.0 Pro / 1.5 Pro / 2.0 等） */
     videoModel: string
+    /** 视频分辨率: 480p | 720p | 1080p */
+    videoResolution: '480p' | '720p' | '1080p'
+    /** 视频画幅: 16:9 | 4:3 | 1:1 | 9:16 | 3:4 */
+    videoRatio: '16:9' | '4:3' | '1:1' | '9:16' | '3:4'
+    /** 是否带水印 */
+    videoWatermark: boolean
   }
 
   // MiniMax 配置
@@ -82,11 +88,14 @@ export function getProviderConfig(): ProviderConfig {
       arkBaseUrl: getEnv('VOLCENGINE_ARK_BASE_URL', 'https://ark.cn-beijing.volces.com/api/v3'),
       imageModel: getEnv('VOLCENGINE_IMAGE_MODEL', 'doubao-seedream-4-0-250828'),
       videoModel: getEnv('VOLCENGINE_VIDEO_MODEL', 'doubao-seedance-1-0-pro-250528'),
+      videoResolution: getEnv('VOLCENGINE_VIDEO_RESOLUTION', '720p') as '480p' | '720p' | '1080p',
+      videoRatio: getEnv('VOLCENGINE_VIDEO_RATIO', '9:16') as '16:9' | '4:3' | '1:1' | '9:16' | '3:4',
+      videoWatermark: getEnv('VOLCENGINE_VIDEO_WATERMARK', 'false').toLowerCase() === 'true',
     },
 
     minimax: {
       apiKey: getEnv('MINIMAX_API_KEY'),
-      baseUrl: 'https://api.minimax.chat',
+      baseUrl: getEnv('MINIMAX_BASE_URL', 'https://api.minimax.chat'),
     },
 
     openai: {

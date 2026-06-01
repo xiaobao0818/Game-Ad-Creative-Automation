@@ -8,6 +8,7 @@ import {
   type DetailedScript,
 } from '../agents/script-generator'
 import { genImage } from '../services/media-gen'
+import { generateAdVideo } from '../agents/video-generator'
 import fs from 'fs'
 import path from 'path'
 
@@ -71,7 +72,7 @@ export async function analyzeProject(
     .set({
       gameGenre: gameProfile.gameGenre,
       artStyle: gameProfile.artStyle,
-      profileJson: JSON.stringify(gameProfile),
+      profileJson: gameProfile,
       status: 'analyzed',
       updatedAt: new Date().toISOString(),
     })
@@ -81,12 +82,11 @@ export async function analyzeProject(
 }
 
 /** 从项目记录中恢复完整的 GameProfile */
-function loadGameProfile(project: any): GameProfile {
-  try {
-    const stored = JSON.parse(project.profileJson || '{}')
-    if (stored.gameGenre) return stored as GameProfile
-  } catch { /* fall through */ }
-
+function loadGameProfile(project: typeof schema.projects.$inferSelect): GameProfile {
+  const stored = project.profileJson
+  if (stored && stored.gameGenre) {
+    return stored as unknown as GameProfile
+  }
   // 兼容旧数据：从单字段重建
   return {
     gameGenre: project.gameGenre || '',
@@ -96,6 +96,22 @@ function loadGameProfile(project: any): GameProfile {
     coreGameplay: '',
     emotionalTone: [],
     summary: project.description || '',
+  }
+}
+
+/**
+ * 校验 scriptId 是否属于指定 project（防 IDOR）。
+ * 不属于则抛出（路由层 try/catch 会转成 400/404）。
+ */
+export async function assertScriptBelongsToProject(scriptId: number, projectId: number): Promise<void> {
+  if (!scriptId || isNaN(scriptId)) throw new Error(`无效的 scriptId: ${scriptId}`)
+  const script = await db.query.scripts.findFirst({
+    where: eq(schema.scripts.id, scriptId),
+    columns: { id: true, projectId: true },
+  })
+  if (!script) throw new Error(`脚本不存在: ${scriptId}`)
+  if (script.projectId !== projectId) {
+    throw new Error(`脚本 ${scriptId} 不属于项目 ${projectId}`)
   }
 }
 
@@ -114,9 +130,9 @@ export async function generateDirections(
     const [record] = await db.insert(schema.scripts).values({
       projectId,
       title: d.name,
-      hookScene: JSON.stringify({ copy: d.outline, visual: '', audio: '', time: '' }),
-      gameplayScenes: '[]',
-      ctaScene: JSON.stringify({ copy: '', visual: '', audio: '', time: '' }),
+      hookScene: { copy: d.outline, visual: '', audio: '', time: '' } as any,
+      gameplayScenes: [] as any,
+      ctaScene: { copy: '', visual: '', audio: '', time: '' } as any,
       fullCopy: `${d.strategy} | ${d.rationale}`,
       tone: d.targetEmotion,
       status: 'direction',
@@ -147,16 +163,16 @@ export async function generateScriptForDirection(
   await db.update(schema.scripts)
     .set({
       title: detailedScript.title,
-      hookScene: JSON.stringify(detailedScript.hook),
-      gameplayScenes: JSON.stringify(detailedScript.gameplayScenes),
-      ctaScene: JSON.stringify(detailedScript.cta),
+      hookScene: detailedScript.hook as any,
+      gameplayScenes: detailedScript.gameplayScenes as any,
+      ctaScene: detailedScript.cta as any,
       fullCopy: [
         detailedScript.hook.copy,
         ...detailedScript.gameplayScenes.map(s => s.copy),
         detailedScript.cta.copy,
       ].join(' '),
       tone: detailedScript.tone,
-      refImagePrompts: JSON.stringify(detailedScript.refImagePrompts || []),
+      refImagePrompts: detailedScript.refImagePrompts || [],
       productionNotes: detailedScript.productionNotes || '',
       status: 'detailed',
     })
@@ -166,26 +182,32 @@ export async function generateScriptForDirection(
 }
 
 /**
- * Stage 5: 生成参考图（调用 Seedream 5.0）
+ * Stage 5: 生成参考图（调用 Seedream）
+ * 串行失败被吞的旧实现换成并行 + 简单重试
  */
 export async function generateReferenceImages(
   scriptId: number,
   refImagePrompts: { sceneKey: string; seedreamPrompt: string }[]
 ): Promise<number[]> {
-  const ids: number[] = []
+  // 1) 并行插入所有 referenceImages 行
+  const records = await db.insert(schema.referenceImages)
+    .values(
+      refImagePrompts.map(ref => ({
+        scriptId,
+        sceneKey: ref.sceneKey,
+        prompt: ref.seedreamPrompt,
+        status: 'generating' as const,
+      }))
+    )
+    .returning({ id: schema.referenceImages.id })
 
-  for (const ref of refImagePrompts) {
-    const [record] = await db.insert(schema.referenceImages).values({
-      scriptId,
-      sceneKey: ref.sceneKey,
-      prompt: ref.seedreamPrompt,
-      status: 'generating',
-    }).returning({ id: schema.referenceImages.id })
+  const ids = records.map(r => r.id)
 
-    ids.push(record.id)
-
+  // 2) 并行触发 Seedream 任务（写入 taskId 或标记 failed）
+  await Promise.all(records.map(async (record, i) => {
+    const ref = refImagePrompts[i]
     try {
-      const { taskId } = await genImage({
+      const { taskId } = await callGenImageWithRetry({
         prompt: ref.seedreamPrompt,
         aspectRatio: '9:16',
         negativePrompt: 'low quality, blurry, distorted, watermark, text, UI, logo, letters',
@@ -199,9 +221,65 @@ export async function generateReferenceImages(
         .set({ status: 'failed' })
         .where(eq(schema.referenceImages.id, record.id))
     }
-  }
+  }))
 
   return ids
+}
+
+/** 调用 genImage，失败时简单退避重试 */
+async function callGenImageWithRetry(
+  params: Parameters<typeof genImage>[0],
+  maxRetries = 2
+): Promise<{ taskId: string }> {
+  let lastErr: unknown
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await genImage(params)
+    } catch (err) {
+      lastErr = err
+      if (attempt === maxRetries) break
+      const waitMs = 500 * Math.pow(2, attempt)
+      await new Promise(r => setTimeout(r, waitMs))
+    }
+  }
+  throw lastErr
+}
+
+/**
+ * Stage 6: 基于脚本 + 已生成的参考图，调用 Seedance 生成最终视频
+ * 复用了 agents/video-generator.ts 中的 assembleVideoPrompt 和 generateAdVideo 逻辑
+ */
+export async function generateAdVideoForScript(
+  scriptId: number,
+  refImageIds: number[]
+): Promise<number> {
+  const script = await db.query.scripts.findFirst({ where: eq(schema.scripts.id, scriptId) })
+  if (!script) throw new Error(`脚本不存在: ${scriptId}`)
+
+  // 加载参考图以拿到 imageUrl（供 Seedance 作为首帧）
+  const refImageRows = await db.select().from(schema.referenceImages)
+    .where(eq(schema.referenceImages.scriptId, scriptId))
+  const refImageUrls: Record<string, string> = {}
+  for (const img of refImageRows) {
+    if (img.imageUrl) refImageUrls[img.sceneKey] = img.imageUrl
+  }
+
+  // 标记脚本进入 production
+  await db.update(schema.scripts)
+    .set({ status: 'in_production', updatedAt: new Date().toISOString() } as any)
+    .where(eq(schema.scripts.id, scriptId))
+
+  return await generateAdVideo(
+    scriptId,
+    {
+      hook: script.hookScene as any,
+      gameplayScenes: (script.gameplayScenes as any) || [],
+      cta: script.ctaScene as any,
+      tone: script.tone || 'exciting',
+    },
+    refImageIds,
+    refImageUrls
+  )
 }
 
 /** 汇总素材文件夹内容 */

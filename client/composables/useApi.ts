@@ -56,6 +56,13 @@ export function useProjects() {
       body: JSON.stringify({ scriptId, refImagePrompts }),
     })
 
+  // Stage 6: 生成最终视频（Seedance）
+  const generateVideo = (projectId: number, scriptId: number, refImageIds: number[]) =>
+    apiFetch<{ status: string; videoId: number }>(`/projects/${projectId}/generate-video`, {
+      method: 'POST',
+      body: JSON.stringify({ scriptId, refImageIds }),
+    })
+
   // 获取项目下脚本列表
   const fetchScripts = (projectId: number) =>
     apiFetch(`/projects/${projectId}/scripts`)
@@ -64,7 +71,7 @@ export function useProjects() {
     projects, loading,
     fetchAll, create, getProject,
     analyzeProject, getDirections, generateDirections,
-    generateScript, generateRefImages, fetchScripts,
+    generateScript, generateRefImages, generateVideo, fetchScripts,
   }
 }
 

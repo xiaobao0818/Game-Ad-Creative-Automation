@@ -142,11 +142,14 @@
             />
           </div>
 
-          <!-- Seedance 合并提示词 -->
+          <!-- Seedance 实际发送的提示词（来自 assembleVideoPrompt）-->
           <div class="prompt-box" style="margin-top: 20px;">
-            <h4 style="margin-bottom: 8px;">完整 Seedance 2.0 视频提示词</h4>
-            <pre class="prompt-text">{{ combinedSeedancePrompt }}</pre>
-            <button class="btn btn-sm" style="margin-top: 8px;" @click="copyText(combinedSeedancePrompt)">复制提示词</button>
+            <h4 style="margin-bottom: 8px;">完整视频提示词</h4>
+            <p style="font-size: 12px; color: var(--color-text-muted); margin-bottom: 8px;">
+              以下是实际发送给 Seedance 的提示词（含场景分段、全局风格、运镜节奏）
+            </p>
+            <pre class="prompt-text">{{ actualVideoPrompt }}</pre>
+            <button class="btn btn-sm" style="margin-top: 8px;" @click="copyText(actualVideoPrompt)">复制提示词</button>
           </div>
 
           <!-- Seedream 参考图提示词 -->
@@ -202,6 +205,49 @@
               </div>
             </div>
           </div>
+
+          <button
+            v-if="canGenerateVideo"
+            class="btn btn-success"
+            style="margin-top: 16px;"
+            :disabled="generatingVideo"
+            @click="doGenerateVideo"
+          >
+            <span v-if="generatingVideo" class="spinner" style="width: 14px; height: 14px; margin-right: 8px;"></span>
+            {{ generatingVideo ? '正在调用火山方舟 Seedance 生成视频...' : '生成最终视频' }}
+            <span style="opacity: 0.7; font-weight: normal; margin-left: 4px;">(火山方舟 Seedance)</span>
+          </button>
+          <div v-else-if="refImages.some(i => i.status === 'failed') && refImages.every(i => ['done','failed'].includes(i.status))" style="margin-top: 12px; color: var(--color-warning); font-size: 13px;">
+            部分参考图生成失败，仍可继续生成视频（无首帧参考）。
+          </div>
+        </div>
+      </div>
+
+      <!-- ====== Step 5: 视频结果 ====== -->
+      <div v-if="videos.length" class="step-card card active">
+        <div class="step-number">5</div>
+        <div class="step-content">
+          <h3>视频（Seedance）</h3>
+          <div v-for="v in videos" :key="v.id" class="video-card">
+            <div v-if="v.model || v.resolution || v.ratio" style="font-size: 12px; color: var(--color-text-muted); margin-bottom: 6px;">
+              模型: {{ v.model || '-' }} · 分辨率: {{ v.resolution || '-' }} · 画幅: {{ v.ratio || '-' }}
+            </div>
+            <div v-if="v.videoUrl" class="video-wrapper">
+              <video :src="v.videoUrl" controls playsinline style="width: 100%; max-width: 360px; aspect-ratio: 9/16; background: #000; border-radius: 8px;"></video>
+              <div style="margin-top: 8px;">
+                <a class="btn btn-sm" :href="v.videoUrl" target="_blank" download>下载视频</a>
+              </div>
+            </div>
+            <div v-else class="video-placeholder">
+              <span v-if="v.status === 'generating' || v.status === 'pending'" class="spinner" style="width: 24px; height: 24px;"></span>
+              <span style="font-size: 13px; color: var(--color-text-muted); margin-top: 10px;">
+                {{ v.status === 'failed' ? '视频生成失败' : '视频生成中（通常 1-5 分钟）...' }}
+              </span>
+              <span v-if="v.status === 'failed' && v.errorMessage" style="font-size: 11px; color: var(--color-danger); margin-top: 6px; max-width: 320px; word-break: break-all;">
+                {{ v.errorMessage }}
+              </span>
+            </div>
+          </div>
         </div>
       </div>
     </template>
@@ -211,9 +257,9 @@
 <script setup lang="ts">
 const route = useRoute()
 const projectId = Number(route.params.id)
-const { getProject, analyzeProject, generateDirections, generateScript, generateRefImages, fetchScripts } = useProjects()
-const { getRefImages } = useScripts()
-const { checkRefImage } = useGenerationStatus()
+const { getProject, analyzeProject, generateDirections, generateScript, generateRefImages, generateVideo, fetchScripts } = useProjects()
+const { getRefImages, getVideos } = useScripts()
+const { checkRefImage, checkVideo } = useGenerationStatus()
 
 const project = ref<any>(null)
 const gameProfile = ref<any>(null)
@@ -224,17 +270,23 @@ const currentScriptId = ref<number>(0)
 const detailedScript = ref<any>(null)
 const refImages = ref<any[]>([])
 const refImageStatus = ref('')
+const videos = ref<any[]>([])
 const currentStep = ref(1)
 
 const analyzing = ref(false)
 const generatingDirections = ref(false)
 const generatingScript = ref(false)
 const generatingRefImages = ref(false)
+const generatingVideo = ref(false)
 const analyzeError = ref('')
 const directionsError = ref('')
 
+// 轮询去重（防止 onMounted 多次进入时 / 多次点击时重复轮询）
+const pollingRefIds = ref(new Set<number>())
+const pollingVideoIds = ref(new Set<number>())
+
 const statusMap: Record<string, string> = {
-  draft: '草稿', analyzed: '已分析', directions_ready: '方向就绪', detailed: '脚本就绪', done: '完成',
+  draft: '草稿', analyzed: '已分析', directions_ready: '方向就绪', detailed: '脚本就绪', in_production: '生产中', done: '完成',
 }
 
 const selectedDirection = computed(() =>
@@ -243,26 +295,51 @@ const selectedDirection = computed(() =>
     : null
 )
 
-const combinedSeedancePrompt = computed(() => {
+const allRefImagesDone = computed(() =>
+  refImages.value.length > 0 && refImages.value.every(i => i.status === 'done')
+)
+
+// 允许视频生成：所有参考图都已"稳定"（done 或 failed），没有还在生成中的
+const canGenerateVideo = computed(() =>
+  refImages.value.length > 0 &&
+  refImages.value.every(i => ['done', 'failed'].includes(i.status))
+)
+
+const actualVideoPrompt = computed(() => {
   if (!detailedScript.value) return ''
-  const parts = [
-    `// Hook (0-3s)\n${detailedScript.value.hook.seedancePrompt}`,
-    ...detailedScript.value.gameplayScenes.map((s: any, i: number) =>
-      `// Scene ${i + 1} (${s.time})\n${s.seedancePrompt}`
-    ),
-    `// CTA (${detailedScript.value.cta.time})\n${detailedScript.value.cta.seedancePrompt}`,
-    '\n// Global\n9:16 vertical, 15 seconds, cinematic transitions, high quality, 30fps',
-  ]
-  return parts.join('\n\n')
+  // 模拟后端 assembleVideoPrompt 的拼装逻辑，让用户能复制到的就是真正发出去的
+  const tone = detailedScript.value.tone || '热血、激动'
+  const hook = detailedScript.value.hook
+  const scenes = detailedScript.value.gameplayScenes || []
+  const cta = detailedScript.value.cta
+
+  const sceneBlocks: string[] = []
+  sceneBlocks.push(`【开场冲击 · 0-3 秒】\n${hook.visual}`)
+  scenes.forEach((s: any, i: number) => {
+    const t = s.time || `${3 + i * 5}-${3 + (i + 1) * 5} 秒`
+    sceneBlocks.push(`【玩法展示 ${i + 1} · ${t}】\n${s.visual}`)
+  })
+  sceneBlocks.push(`【行动号召 · 13-15 秒】\n${cta.visual}`)
+
+  const styleBlock = [
+    '',
+    '【整体风格】',
+    '画风: 游戏级电影感渲染，色彩饱和，光影强烈。',
+    '运镜: 连续的电影感剪辑，开场有强烈推拉镜头，过程中多用平移和跟随镜头，结尾轻微拉远收束。',
+    '节奏: 15 秒紧凑叙事，前 3 秒必须抓眼球，结尾给观众明确的行动指引。',
+    `整体情绪: ${tone}。`,
+    '画面: 9:16 竖屏，移动端信息流广告质感，高保真 30 帧流畅运镜。',
+  ].join('\n')
+
+  return sceneBlocks.join('\n\n') + '\n' + styleBlock
 })
 
 onMounted(async () => {
   project.value = await getProject(projectId)
-  // 如果有已保存的 profile，恢复
-  try {
-    const stored = JSON.parse(project.value.profileJson || '{}')
-    if (stored.gameGenre) gameProfile.value = stored
-  } catch { /* 无已保存档案 */ }
+  // profileJson 已经是 Drizzle JSON mode 自动反序列化后的对象，不要再 JSON.parse
+  if (project.value?.profileJson && project.value.profileJson.gameGenre) {
+    gameProfile.value = project.value.profileJson
+  }
 
   // 尝试恢复已有的 directions
   try {
@@ -304,6 +381,18 @@ onMounted(async () => {
       const imgs = await getRefImages(s.id)
       if (imgs.length > 0) {
         refImages.value = imgs
+      }
+
+      // 检查视频
+      const vids = await getVideos(s.id)
+      if (vids.length > 0) {
+        videos.value = vids
+        currentStep.value = 5
+        for (const v of vids) {
+          if ((v.status === 'generating' || v.status === 'pending') && v.seedanceTaskId) {
+            pollVideo(v.id)
+          }
+        }
       }
     }
   } catch { /* 首次进入 */ }
@@ -379,27 +468,79 @@ async function loadRefImages(scriptId: number) {
   const images = await getRefImages(scriptId)
   refImages.value = images
   for (const img of images) {
-    if ((img.status === 'generating' || img.status === 'pending') && img.seedreamTaskId) {
+    if ((img.status === 'generating' || img.status === 'pending') && img.seedreamTaskId && !pollingRefIds.value.has(img.id)) {
       pollRefImage(img.id)
     }
   }
 }
 
 async function pollRefImage(id: number) {
-  const maxPolls = 30
-  for (let i = 0; i < maxPolls; i++) {
-    await new Promise(r => setTimeout(r, 3000))
-    try {
-      const result = await checkRefImage(id)
-      if (result.status === 'completed') {
-        refImageStatus.value = 'done'
-        if (currentScriptId.value) {
-          refImages.value = await getRefImages(currentScriptId.value)
+  pollingRefIds.value.add(id)
+  try {
+    const maxPolls = 30
+    for (let i = 0; i < maxPolls; i++) {
+      await new Promise(r => setTimeout(r, 3000))
+      try {
+        const result = await checkRefImage(id)
+        if (result.status === 'completed') {
+          refImageStatus.value = 'done'
+          if (currentScriptId.value) {
+            refImages.value = await getRefImages(currentScriptId.value)
+          }
+          return
         }
-        return
-      }
-      if (result.status === 'failed') return
-    } catch { break }
+        if (result.status === 'failed') return
+      } catch { break }
+    }
+  } finally {
+    pollingRefIds.value.delete(id)
+  }
+}
+
+async function doGenerateVideo() {
+  if (!currentScriptId.value) {
+    alert('无法确定脚本ID，请重新生成脚本')
+    return
+  }
+  const refImageIds = refImages.value.map(i => i.id)
+
+  generatingVideo.value = true
+  try {
+    await generateVideo(projectId, currentScriptId.value, refImageIds)
+    currentStep.value = 5
+    const vids = await getVideos(currentScriptId.value)
+    videos.value = vids
+    for (const v of vids) {
+      if (v.seedanceTaskId) pollVideo(v.id)
+    }
+  } catch (e: any) {
+    alert('生成视频失败: ' + e.message)
+  } finally {
+    generatingVideo.value = false
+  }
+}
+
+async function pollVideo(id: number) {
+  // Seedance 1.5/2.0 在 1080p 下经常 5-7 分钟，按 4s 间隔最多 15 分钟
+  const maxPolls = 225
+  const startTime = Date.now()
+  const maxDurationMs = 15 * 60 * 1000
+  try {
+    while (Date.now() - startTime < maxDurationMs) {
+      await new Promise(r => setTimeout(r, 4000))
+      try {
+        const result = await checkVideo(id)
+        if (result.status === 'completed') {
+          if (currentScriptId.value) {
+            videos.value = await getVideos(currentScriptId.value)
+          }
+          return
+        }
+        if (result.status === 'failed') return
+      } catch { break }
+    }
+  } finally {
+    pollingVideoIds.value.delete(id)
   }
 }
 
@@ -604,6 +745,32 @@ function copyText(text: string) {
   flex-direction: column;
   align-items: center;
   justify-content: center;
+}
+
+.video-card {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.video-wrapper {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.video-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 20px;
+  background: var(--color-bg);
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius-sm);
+  width: 100%;
+  max-width: 360px;
 }
 
 @media (max-width: 768px) {

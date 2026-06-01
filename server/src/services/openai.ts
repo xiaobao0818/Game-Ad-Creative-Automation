@@ -24,6 +24,10 @@ function createClient(provider: ProviderType = 'volcengine'): OpenAI {
 /** 将本地文件转为 base64 data URI（OpenAI Vision API 需要） */
 function fileToDataUri(filePath: string): string {
   const buffer = fs.readFileSync(filePath)
+  const maxBytes = Number(process.env.MAX_IMAGE_BYTES) || 4 * 1024 * 1024  // 默认 4MB
+  if (buffer.byteLength > maxBytes) {
+    throw new Error(`图片 ${filePath} 超过大小限制 (${(buffer.byteLength / 1024 / 1024).toFixed(1)}MB > ${(maxBytes / 1024 / 1024).toFixed(1)}MB)`)
+  }
   const ext = path.extname(filePath).toLowerCase().replace('.', '')
   const mimeMap: Record<string, string> = {
     png: 'image/png',

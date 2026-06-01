@@ -1,12 +1,14 @@
 import { Hono } from 'hono'
 import { db, schema } from '../db'
-import { eq, desc } from 'drizzle-orm'
+import { eq, desc, inArray } from 'drizzle-orm'
 import {
   analyzeProject,
   generateDirections,
   generateScriptForDirection,
   generateReferenceImages,
+  generateAdVideoForScript,
   loadGameProfile,
+  assertScriptBelongsToProject,
 } from '../pipeline'
 
 const app = new Hono()
@@ -62,7 +64,7 @@ app.post('/:id/analyze', async (c) => {
       stats: { textCount: texts.length, imageCount: imagePaths.length },
     })
   } catch (err: any) {
-    return c.json({ status: 'error', message: err.message }, 500)
+    return c.json({ status: 'error', message: err?.message ?? String(err) }, 500)
   }
 })
 
@@ -79,7 +81,7 @@ app.post('/:id/directions', async (c) => {
     const { directions, scriptIds } = await generateDirections(id, gameProfile)
     return c.json({ status: 'ready', directions, scriptIds })
   } catch (err: any) {
-    return c.json({ status: 'error', message: err.message }, 500)
+    return c.json({ status: 'error', message: err?.message ?? String(err) }, 500)
   }
 })
 
@@ -100,6 +102,13 @@ app.post('/:id/generate-script', async (c) => {
   const project = await db.query.projects.findFirst({ where: eq(schema.projects.id, id) })
   if (!project) return c.json({ error: '项目不存在' }, 404)
 
+  // IDOR 检查：scriptId 必须属于这个项目
+  try {
+    await assertScriptBelongsToProject(scriptId, id)
+  } catch (err: any) {
+    return c.json({ error: err.message }, 400)
+  }
+
   // 从数据库恢复 gameProfile
   const gameProfile = loadGameProfile(project)
 
@@ -119,16 +128,17 @@ app.post('/:id/generate-script', async (c) => {
       scriptId,
       gameProfile,
       finalDirection,
-      project.assetPath
+      project.assetPath || ''
     )
     return c.json({ status: 'done', script: detailedScript })
   } catch (err: any) {
-    return c.json({ status: 'error', message: err.message }, 500)
+    return c.json({ status: 'error', message: err?.message ?? String(err) }, 500)
   }
 })
 
 /** Stage 5: 为脚本生成参考图 */
 app.post('/:id/generate-ref-images', async (c) => {
+  const id = Number(c.req.param('id'))
   const body = await c.req.json()
   const { scriptId, refImagePrompts } = body
 
@@ -136,11 +146,55 @@ app.post('/:id/generate-ref-images', async (c) => {
     return c.json({ error: '缺少 scriptId 或 refImagePrompts' }, 400)
   }
 
+  // IDOR 检查
+  try {
+    await assertScriptBelongsToProject(scriptId, id)
+  } catch (err: any) {
+    return c.json({ error: err.message }, 400)
+  }
+
   try {
     const ids = await generateReferenceImages(scriptId, refImagePrompts)
     return c.json({ status: 'generating', refImageIds: ids })
   } catch (err: any) {
-    return c.json({ status: 'error', message: err.message }, 500)
+    return c.json({ status: 'error', message: err?.message ?? String(err) }, 500)
+  }
+})
+
+/** Stage 6: 基于脚本和参考图，生成最终视频（Seedance） */
+app.post('/:id/generate-video', async (c) => {
+  const id = Number(c.req.param('id'))
+  const body = await c.req.json()
+  const { scriptId, refImageIds } = body
+
+  if (!scriptId) {
+    return c.json({ error: '缺少 scriptId' }, 400)
+  }
+
+  const project = await db.query.projects.findFirst({ where: eq(schema.projects.id, id) })
+  if (!project) return c.json({ error: '项目不存在' }, 404)
+
+  // IDOR 检查 + 引用图也要属于该脚本
+  try {
+    await assertScriptBelongsToProject(scriptId, id)
+    if (refImageIds?.length) {
+      const rows = await db.select({ id: schema.referenceImages.id, scriptId: schema.referenceImages.scriptId })
+        .from(schema.referenceImages)
+        .where(inArray(schema.referenceImages.id, refImageIds))
+      const orphan = rows.find(r => r.scriptId !== scriptId)
+      if (orphan) {
+        return c.json({ error: `参考图 ${orphan.id} 不属于脚本 ${scriptId}` }, 400)
+      }
+    }
+  } catch (err: any) {
+    return c.json({ error: err.message }, 400)
+  }
+
+  try {
+    const videoId = await generateAdVideoForScript(scriptId, refImageIds || [])
+    return c.json({ status: 'generating', videoId })
+  } catch (err: any) {
+    return c.json({ status: 'error', message: err?.message ?? String(err) }, 500)
   }
 })
 
@@ -151,21 +205,7 @@ app.get('/:id/scripts', async (c) => {
     .where(eq(schema.scripts.projectId, id))
     .orderBy(desc(schema.scripts.createdAt))
 
-  const parsed = scripts.map(s => {
-    try {
-      return {
-        ...s,
-        hookScene: JSON.parse(s.hookScene),
-        gameplayScenes: JSON.parse(s.gameplayScenes),
-        ctaScene: JSON.parse(s.ctaScene),
-        refImagePrompts: JSON.parse(s.refImagePrompts || '[]'),
-      }
-    } catch {
-      return s
-    }
-  })
-
-  return c.json(parsed)
+  return c.json(scripts)
 })
 
 export default app

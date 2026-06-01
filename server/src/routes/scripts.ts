@@ -5,20 +5,28 @@ import { queryImageGenTask, queryVideoGenTask } from '../services/media-gen'
 
 const app = new Hono()
 
+// 状态白名单：避免 PATCH 写入任意值
+const SCRIPT_STATUS_VALUES = new Set(['draft', 'direction', 'detailed', 'in_production', 'done'])
+
 /** 更新脚本内容（用户编辑后保存） */
 app.patch('/:id', async (c) => {
   const id = Number(c.req.param('id'))
   const body = await c.req.json()
 
-  const updates: any = {}
+  const updates: Partial<typeof schema.scripts.$inferInsert> = {}
   if (body.title !== undefined) updates.title = body.title
-  if (body.hookScene !== undefined) updates.hookScene = JSON.stringify(body.hookScene)
-  if (body.gameplayScenes !== undefined) updates.gameplayScenes = JSON.stringify(body.gameplayScenes)
-  if (body.ctaScene !== undefined) updates.ctaScene = JSON.stringify(body.ctaScene)
+  if (body.hookScene !== undefined) updates.hookScene = body.hookScene
+  if (body.gameplayScenes !== undefined) updates.gameplayScenes = body.gameplayScenes
+  if (body.ctaScene !== undefined) updates.ctaScene = body.ctaScene
   if (body.fullCopy !== undefined) updates.fullCopy = body.fullCopy
-  if (body.status !== undefined) updates.status = body.status
+  if (body.status !== undefined) {
+    if (!SCRIPT_STATUS_VALUES.has(body.status)) {
+      return c.json({ error: `无效的 status 值: ${body.status}` }, 400)
+    }
+    updates.status = body.status
+  }
   if (body.tone !== undefined) updates.tone = body.tone
-  if (body.refImagePrompts !== undefined) updates.refImagePrompts = JSON.stringify(body.refImagePrompts)
+  if (body.refImagePrompts !== undefined) updates.refImagePrompts = body.refImagePrompts
   if (body.productionNotes !== undefined) updates.productionNotes = body.productionNotes
 
   if (Object.keys(updates).length === 0) {
@@ -29,13 +37,7 @@ app.patch('/:id', async (c) => {
   const updated = await db.query.scripts.findFirst({ where: eq(schema.scripts.id, id) })
   if (!updated) return c.json({ error: '脚本不存在' }, 404)
 
-  return c.json({
-    ...updated,
-    hookScene: safeParse(updated.hookScene),
-    gameplayScenes: safeParse(updated.gameplayScenes),
-    ctaScene: safeParse(updated.ctaScene),
-    refImagePrompts: safeParse(updated.refImagePrompts),
-  })
+  return c.json(updated)
 })
 
 /** 获取单个脚本详情 */
@@ -43,13 +45,7 @@ app.get('/:id', async (c) => {
   const id = Number(c.req.param('id'))
   const script = await db.query.scripts.findFirst({ where: eq(schema.scripts.id, id) })
   if (!script) return c.json({ error: '脚本不存在' }, 404)
-  return c.json({
-    ...script,
-    hookScene: safeParse(script.hookScene),
-    gameplayScenes: safeParse(script.gameplayScenes),
-    ctaScene: safeParse(script.ctaScene),
-    refImagePrompts: safeParse(script.refImagePrompts),
-  })
+  return c.json(script)
 })
 
 /** 获取脚本的参考图 */
@@ -85,12 +81,15 @@ app.get('/ref-image/:id/check', async (c) => {
         .where(eq(schema.referenceImages.id, id))
     } else if (result.status === 'failed') {
       await db.update(schema.referenceImages)
-        .set({ status: 'failed' })
+        .set({
+          status: 'failed',
+          // 参考图表没加 errorMessage 列,放 prompt 末尾或省略;此处不写避免破坏 schema
+        })
         .where(eq(schema.referenceImages.id, id))
     }
     return c.json(result)
   } catch (err: any) {
-    return c.json({ status: 'error', message: err.message }, 500)
+    return c.json({ status: 'error', message: err?.message ?? String(err) }, 500)
   }
 })
 
@@ -109,17 +108,16 @@ app.get('/video/:id/check', async (c) => {
         .where(eq(schema.videoGenerations.id, id))
     } else if (result.status === 'failed') {
       await db.update(schema.videoGenerations)
-        .set({ status: 'failed' })
+        .set({
+          status: 'failed',
+          errorMessage: result.errorMessage || '视频生成失败(上游未返回原因)',
+        })
         .where(eq(schema.videoGenerations.id, id))
     }
     return c.json(result)
   } catch (err: any) {
-    return c.json({ status: 'error', message: err.message }, 500)
+    return c.json({ status: 'error', message: err?.message ?? String(err) }, 500)
   }
 })
-
-function safeParse(str: string) {
-  try { return JSON.parse(str) } catch { return str }
-}
 
 export default app
